@@ -1,0 +1,443 @@
+"""
+docling_actions.py
+==================
+Sema4.ai Action Package – docling-tools
+
+Provides three @action-decorated tools:
+  1. parse_document          – Full parse (markdown/JSON) + image extraction.
+  2. extract_and_save_images – Image-only extraction with public URL list.
+  3. convert_to_markdown     – Lightweight, fast markdown conversion.
+
+Images are saved to /home/franjr/ai-research/public/images/docling/
+and served via a separate static server on port 8082.
+"""
+from __future__ import annotations
+
+# ── Standard library ─────────────────────────────────────────────────────────
+import hashlib
+import json
+import logging
+import os
+import tempfile
+import time
+import traceback
+import uuid
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urljoin
+
+# ── Third-party ───────────────────────────────────────────────────────────────
+import httpx
+from PIL import Image
+
+# Docling core
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import (
+    PdfPipelineOptions,
+    EasyOcrOptions,
+    TableFormerMode,
+)
+from docling.datamodel.document import ConversionResult
+
+# Sema4.ai action runtime — SOLO action, NO get_app
+from sema4ai.actions import action
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants & paths
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Where images are stored on disk
+PUBLIC_IMAGES_DIR = Path("/home/franjr/ai-research/public/images/docling")
+PUBLIC_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+# URL path segment for constructing public URLs
+STATIC_URL_PATH: str = "/public/images/docling"
+
+logger.info("Public image directory ready: %s", PUBLIC_IMAGES_DIR)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_filename(prefix: str, suffix: str = ".png") -> str:
+    """Generate a collision-resistant filename."""
+    clean_prefix = "".join(c if c.isalnum() or c == "_" else "_" for c in prefix)
+    ts = int(time.time() * 1000)
+    uid = uuid.uuid4().hex[:8]
+    return f"{clean_prefix}_{ts}_{uid}{suffix}"
+
+
+def _build_public_url(base_url: str, filename: str) -> str:
+    """Construct the publicly accessible URL for a saved image.
+
+    Images are served by a static file server (python3 -m http.server 8082)
+    running from /home/franjr/ai-research/
+
+    Example result:
+        http://localhost:8082/public/images/docling/report_p2_abc123.png
+    """
+    base = base_url.rstrip("/")
+    return f"{base}{STATIC_URL_PATH}/{filename}"
+
+
+def _download_to_temp(url: str) -> Path:
+    """Download a remote URL to a named temporary file and return its path."""
+    headers = {"User-Agent": "docling-tools/1.0 (+https://sema4.ai)"}
+    with httpx.Client(
+        follow_redirects=True,
+        timeout=httpx.Timeout(connect=120.0, read=300.0, write=60.0, pool=10.0),
+        headers=headers,
+    ) as client:
+        response = client.get(url)
+        response.raise_for_status()
+
+    # Determine suffix from Content-Type
+    ct = response.headers.get("content-type", "").split(";")[0].strip()
+    ext_map = {
+        "application/pdf": ".pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/msword": ".doc",
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "text/html": ".html",
+    }
+    suffix = ext_map.get(ct, ".bin")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(response.content)
+    tmp.flush()
+    tmp.close()
+    logger.info("Downloaded %s → %s (%d bytes)", url, tmp.name, len(response.content))
+    return Path(tmp.name)
+
+
+def _build_pipeline_options(save_images: bool = True) -> PdfPipelineOptions:
+    """Create PdfPipelineOptions tuned for high-quality extraction."""
+    ocr_opts = EasyOcrOptions(
+        use_gpu=False,
+        lang=["en", "es"],
+    )
+    pipeline_opts = PdfPipelineOptions(
+        do_ocr=True,
+        ocr_options=ocr_opts,
+        do_table_structure=True,
+        table_structure_options={
+            "mode": TableFormerMode.ACCURATE,
+            "do_cell_matching": True,
+        },
+        generate_page_images=save_images,
+        generate_picture_images=save_images,
+    )
+    return pipeline_opts
+
+
+def _resolve_source(source: str) -> tuple[Path, bool]:
+    """Resolve source to an absolute local path, downloading if necessary.
+
+    Returns:
+        Tuple of (path, is_temp) where is_temp means caller should delete it.
+    """
+    if source.startswith("http://") or source.startswith("https://"):
+        return _download_to_temp(source), True
+
+    local = Path(source)
+    if not local.exists():
+        raise FileNotFoundError(f"Local source not found: {source}")
+    return local.resolve(), False
+
+
+def _save_docling_images(
+    conv_result: ConversionResult,
+    doc_slug: str,
+    base_url: str,
+) -> list[dict]:
+    """Persist all images from a Docling conversion result to the public folder."""
+    saved: list[dict] = []
+    doc = conv_result.document
+
+    if not hasattr(doc, "pictures") or not doc.pictures:
+        logger.info("No pictures found in document.")
+        return saved
+
+    for pic in doc.pictures:
+        try:
+            pil_image: Optional[Image.Image] = pic.get_image(doc)
+            if pil_image is None:
+                continue
+
+            page_no = getattr(pic.prov[0], "page_no", 0) if pic.prov else 0
+            elem_type = getattr(pic, "label", "picture")
+
+            short_hash = hashlib.md5(
+                str(getattr(pic, "self_ref", uuid.uuid4())).encode()
+            ).hexdigest()[:8]
+
+            filename = _safe_filename(
+                f"{doc_slug}_p{page_no}_{elem_type}_{short_hash}"
+            )
+            dest_path = PUBLIC_IMAGES_DIR / filename
+
+            if pil_image.mode not in ("RGB", "L"):
+                pil_image = pil_image.convert("RGB")
+
+            pil_image.save(dest_path, format="PNG", optimize=True)
+            size_bytes = dest_path.stat().st_size
+
+            entry = {
+                "filename": filename,
+                "public_url": _build_public_url(base_url, filename),
+                "page": page_no,
+                "type": str(elem_type),
+                "width": pil_image.width,
+                "height": pil_image.height,
+                "size_bytes": size_bytes,
+            }
+            saved.append(entry)
+            logger.info("Saved image: %s (%d bytes)", filename, size_bytes)
+
+        except Exception as exc:
+            logger.warning("Failed to save image element: %s", exc)
+
+    return saved
+
+
+def _default_base_url() -> str:
+    """Return the base URL for serving images.
+
+    Priority:
+    1. ACTION_SERVER_URL env var (set by --expose)
+    2. http://localhost:8082 (static file server)
+    """
+    return os.environ.get("ACTION_SERVER_URL", "http://localhost:8082").rstrip("/")
+
+
+def _cleanup_temp(is_temp: bool, source_path: Optional[Path]) -> None:
+    """Safely remove temporary downloaded files."""
+    if is_temp and source_path is not None:
+        try:
+            source_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# @action definitions
+# ─────────────────────────────────────────────────────────────────────────────
+
+@action(is_consequential=True)
+def parse_document(
+    source: str,
+    output_format: str = "markdown",
+    save_images: bool = True,
+    public_base_url: str = "",
+) -> str:
+    """Parse a PDF or document with Docling OCR and return full structured content.
+
+    Uses Docling's DocumentConverter with EasyOCR and TableFormer (ACCURATE mode)
+    to extract text, tables, figures, headings, lists, and metadata.
+
+    When save_images=True, embedded figures and pictures are saved as PNG files
+    and their public URLs are included in the response.
+
+    Args:
+        source: HTTP/HTTPS URL or absolute local file path to the document.
+        output_format: 'markdown' (default) or 'json'.
+        save_images: When True, extract and save images. False for text-only.
+        public_base_url: Root URL for image URLs. Falls back to ACTION_SERVER_URL
+            env var or http://localhost:8082.
+
+    Returns:
+        JSON string with status, content, page_count, images array, and image_count.
+    """
+    base_url = public_base_url.strip() or _default_base_url()
+    is_temp = False
+    source_path = None
+
+    try:
+        source_path, is_temp = _resolve_source(source)
+        doc_slug = source_path.stem[:20].replace(" ", "_").lower()
+
+        pipeline_opts = _build_pipeline_options(save_images=save_images)
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_opts)
+            }
+        )
+
+        logger.info("Starting conversion: %s (format=%s)", source_path, output_format)
+        conv_result: ConversionResult = converter.convert(str(source_path))
+
+        # Extract text content
+        if output_format.lower() == "json":
+            content = conv_result.document.export_to_dict()
+            content_str = json.dumps(content, ensure_ascii=False, default=str)
+        else:
+            content_str = conv_result.document.export_to_markdown()
+
+        # Extract and save images
+        images: list[dict] = []
+        if save_images:
+            images = _save_docling_images(conv_result, doc_slug, base_url)
+
+        # Page count
+        page_count = 0
+        if hasattr(conv_result.document, "pages"):
+            page_count = len(conv_result.document.pages)
+
+        payload = {
+            "status": "success",
+            "source": source,
+            "output_format": output_format,
+            "content": content_str,
+            "page_count": page_count,
+            "images": images,
+            "image_count": len(images),
+        }
+
+    except Exception as exc:
+        logger.error("parse_document failed: %s", exc, exc_info=True)
+        payload = {
+            "status": "error",
+            "source": source,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+    finally:
+        _cleanup_temp(is_temp, source_path)
+
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+@action(is_consequential=True)
+def extract_and_save_images(
+    source: str,
+    output_subdir: str = "docling",
+    public_base_url: str = "",
+) -> str:
+    """Extract and persist every image in a document, returning public URLs.
+
+    Focuses exclusively on image extraction. No document text is returned.
+
+    Args:
+        source: HTTP/HTTPS URL or absolute local file path to the document.
+        output_subdir: Prefix used in filenames for organization. Defaults to 'docling'.
+        public_base_url: Root URL for image URLs. Falls back to ACTION_SERVER_URL
+            env var or http://localhost:8082.
+
+    Returns:
+        JSON string with status, source, image_count, and images array.
+    """
+    base_url = public_base_url.strip() or _default_base_url()
+    is_temp = False
+    source_path = None
+
+    try:
+        source_path, is_temp = _resolve_source(source)
+        doc_slug = output_subdir[:15].replace(" ", "_").lower()
+
+        pipeline_opts = _build_pipeline_options(save_images=True)
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_opts)
+            }
+        )
+
+        logger.info("Extracting images from: %s", source_path)
+        conv_result = converter.convert(str(source_path))
+        images = _save_docling_images(conv_result, doc_slug, base_url)
+
+        payload = {
+            "status": "success",
+            "source": source,
+            "image_count": len(images),
+            "images": images,
+        }
+
+    except Exception as exc:
+        logger.error("extract_and_save_images failed: %s", exc, exc_info=True)
+        payload = {
+            "status": "error",
+            "source": source,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+    finally:
+        _cleanup_temp(is_temp, source_path)
+
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+@action
+def convert_to_markdown(
+    source: str,
+    save_images: bool = True,
+    public_base_url: str = "",
+) -> str:
+    """Convert a document to clean Markdown, optionally extracting image URLs.
+
+    Lightweight action optimised for text extraction.
+
+    Args:
+        source: HTTP/HTTPS URL or absolute local path.
+        save_images: When True, images are extracted and URLs included.
+        public_base_url: Root URL for image URLs. Falls back to ACTION_SERVER_URL
+            env var or http://localhost:8082.
+
+    Returns:
+        JSON string with status, source, markdown, images, char_count, image_count.
+    """
+    base_url = public_base_url.strip() or _default_base_url()
+    is_temp = False
+    source_path = None
+
+    try:
+        source_path, is_temp = _resolve_source(source)
+        doc_slug = source_path.stem[:20].replace(" ", "_").lower()
+
+        pipeline_opts = _build_pipeline_options(save_images=save_images)
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_opts)
+            }
+        )
+
+        logger.info("Converting to Markdown: %s", source_path)
+        conv_result = converter.convert(str(source_path))
+        markdown_text: str = conv_result.document.export_to_markdown()
+
+        images: list[dict] = []
+        if save_images:
+            images = _save_docling_images(conv_result, doc_slug, base_url)
+
+        payload = {
+            "status": "success",
+            "source": source,
+            "markdown": markdown_text,
+            "images": images,
+            "char_count": len(markdown_text),
+            "image_count": len(images),
+        }
+
+    except Exception as exc:
+        logger.error("convert_to_markdown failed: %s", exc, exc_info=True)
+        payload = {
+            "status": "error",
+            "source": source,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+    finally:
+        _cleanup_temp(is_temp, source_path)
+
+    return json.dumps(payload, ensure_ascii=False, indent=2)
